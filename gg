@@ -1,0 +1,181 @@
+# main.py
+
+import asyncio
+import os
+import signal
+import json
+import subprocess
+from flask import Flask, render_template_string, request, redirect
+from telethon import TelegramClient
+from pytgcalls import PyTgCalls, idle
+import yt_dlp
+
+app = Flask(__name__)
+SETTINGS_FILE = 'settings.json'
+PID_FILE = 'stream.pid'
+
+HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>لوحة تحكم البث</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Tahoma; background: #111; color: #eee; padding: 30px; }
+        input, button { padding: 10px; margin: 5px 0; width: 100%; border-radius: 8px; border: none; }
+        input { background: #222; color: #fff; }
+        button { background: #007bff; color: white; cursor: pointer; }
+        button.stop { background: #dc3545; }
+        .status { margin: 10px 0; padding: 10px; background: #222; border-left: 5px solid #007bff; }
+    </style>
+</head>
+<body>
+    <h2>🎬 لوحة تحكم البث - Telethon + PyTgCalls</h2>
+    <div class="status">
+        ✅ حالة البث: <b>{{ 'يعمل' if is_running else 'متوقف' }}</b>
+    </div>
+    <form method="POST">
+        <label>🎥 رابط الفيديو / البث المباشر:</label>
+        <input type="text" name="INPUT_SOURCE" value="{{ settings.INPUT_SOURCE }}" required>
+        <label>📢 معرف المجموعة / القناة (@ أو ID):</label>
+        <input type="text" name="CHAT_ID" value="{{ settings.CHAT_ID }}" required>
+        <label>🍪 ملف الكوكيز (اختياري):</label>
+        <input type="text" name="COOKIES_FILE" value="{{ settings.COOKIES_FILE }}">
+        <button type="submit" name="action" value="save">💾 حفظ الإعدادات</button>
+        {% if not is_running %}
+            <button type="submit" name="action" value="start">▶️ بدء البث</button>
+        {% else %}
+            <button type="submit" name="action" value="stop" class="stop">⏹️ إيقاف البث</button>
+        {% endif %}
+    </form>
+</body>
+</html>
+'''
+
+API_ID = 26590422
+API_HASH = '75885ed8528b2927f7872b240529165d'
+SESSION_NAME = 'gg'
+
+def read_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {
+            "INPUT_SOURCE": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "CHAT_ID": "@iraq23000",
+            "COOKIES_FILE": "cookies.txt"
+        }
+    with open(SETTINGS_FILE, 'r') as f:
+        return json.load(f)
+
+def write_settings(data):
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(data, f)
+
+def is_stream_running():
+    if not os.path.exists(PID_FILE):
+        return False
+    with open(PID_FILE, 'r') as f:
+        pid = int(f.read())
+    return os.path.exists(f'/proc/{pid}')
+
+def start_stream():
+    if is_stream_running():
+        return
+    proc = subprocess.Popen(['python3', __file__, 'run_stream'])
+    with open(PID_FILE, 'w') as f:
+        f.write(str(proc.pid))
+
+def stop_stream():
+    if not is_stream_running():
+        return
+    with open(PID_FILE, 'r') as f:
+        pid = int(f.read())
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except:
+        pass
+    os.remove(PID_FILE)
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    settings = read_settings()
+    if request.method == 'POST':
+        action = request.form['action']
+        settings['INPUT_SOURCE'] = request.form['INPUT_SOURCE']
+        settings['CHAT_ID'] = request.form['CHAT_ID']
+        settings['COOKIES_FILE'] = request.form['COOKIES_FILE']
+        write_settings(settings)
+        if action == 'start':
+            stop_stream()
+            start_stream()
+        elif action == 'stop':
+            stop_stream()
+        return redirect('/')
+    return render_template_string(HTML, settings=settings, is_running=is_stream_running())
+
+# ✅ تعديل استخلاص رابط يوتيوب بجودة منخفضة للبث المستقر
+async def get_youtube_stream_url(url: str, cookies_file: str = None) -> str:
+    ydl_opts = {
+        'format': 'worst[ext=mp4]/worstvideo+bestaudio',
+        'noplaylist': True,
+        'quiet': True,
+        'simulate': True,
+        'force_generic_extractor': False,
+        'prefer_free_formats': True,
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+    }
+    if cookies_file:
+        ydl_opts['cookiefile'] = cookies_file
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            for f in info.get('formats', []):
+                if 'url' in f and f.get('vcodec') != 'none' and f.get('acodec') != 'none':
+                    return f['url']
+            if 'url' in info:
+                return info['url']
+    except Exception as e:
+        print(f"❌ خطأ في استخراج رابط يوتيوب: {e}")
+    raise Exception("لم يتم العثور على رابط بث صالح")
+
+async def stream_main():
+    settings = read_settings()
+    INPUT_SOURCE = settings['INPUT_SOURCE']
+    CHAT_ID = settings['CHAT_ID']
+    COOKIES_FILE = settings['COOKIES_FILE']
+
+    tele_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    await tele_client.start()
+    pytgcalls_client = PyTgCalls(tele_client)
+
+    await pytgcalls_client.start()
+    stream_source = INPUT_SOURCE
+
+    if "youtube.com" in INPUT_SOURCE or "youtu.be" in INPUT_SOURCE:
+        try:
+            print("🔍 جاري استخراج رابط يوتيوب...")
+            stream_source = await get_youtube_stream_url(INPUT_SOURCE, COOKIES_FILE)
+            print(f"✅ تم الاستخراج: {stream_source}")
+        except Exception as e:
+            print(f"⚠️ فشل الاستخراج، استخدام الرابط الأصلي: {e}")
+
+    try:
+        await pytgcalls_client.play(CHAT_ID, stream_source)
+        print("✅ بدأ البث")
+        await idle()
+    except Exception as e:
+        print(f"❌ حدث خطأ أثناء البث: {e}")
+    finally:
+        try:
+            await pytgcalls_client.leave_group_call(CHAT_ID)
+        except:
+            pass
+        await tele_client.disconnect()
+        print("📴 تم إنهاء البث")
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'run_stream':
+        asyncio.run(stream_main())
+    else:
+        app.run(host='0.0.0.0', port=8000)

@@ -1,0 +1,567 @@
+from flask import Flask, request, jsonify, render_template_string
+import subprocess
+import threading
+import time
+
+app = Flask(__name__)
+stream_process = None
+stream_lock = threading.Lock()
+stop_event = threading.Event()
+active_thread = None
+
+stream_info = {
+    "status": "متوقف",
+    "quality": None,
+    "source_url": None,
+    "rtmp_url": None,
+    "last_error": None,
+    "start_time": None,
+    "restart_count": 0,
+    "thread_id": None,
+    "bitrate": None,
+    "resolution": None
+}
+
+QUALITY_OPTIONS = {
+    "360": {"scale": "640:360", "bitrate": "800k"},
+    "480": {"scale": "854:480", "bitrate": "1400k"},
+    "720": {"scale": "1280:720", "bitrate": "2800k"},
+}
+
+def run_ffmpeg(source_url, rtmp_url, quality, thread_id):
+    global stream_process, stream_info
+    scale = QUALITY_OPTIONS[quality]["scale"]
+    bitrate = QUALITY_OPTIONS[quality]["bitrate"]
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-re",
+        "-i", source_url,
+        "-vf", f"scale={scale}",
+        "-c:v", "libx264", "-preset", "veryfast", "-b:v", bitrate,
+        "-maxrate", bitrate, "-bufsize", "2M",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-f", "flv", rtmp_url
+    ]
+    while not stop_event.is_set() and stream_info.get("thread_id") == thread_id:
+        with stream_lock:
+            stream_info["status"] = "جارٍ البث"
+            stream_info["start_time"] = time.time()
+            stream_info["last_error"] = None
+            stream_info["restart_count"] += 1
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with stream_lock:
+                stream_process = proc
+            while not stop_event.is_set() and stream_info.get("thread_id") == thread_id:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode()
+                with stream_lock:
+                    stream_info["last_error"] = stderr
+                    stream_info["status"] = "خطأ - يعيد المحاولة"
+        except Exception as e:
+            with stream_lock:
+                stream_info["last_error"] = str(e)
+                stream_info["status"] = "خطأ - يعيد المحاولة"
+        time.sleep(2)
+    with stream_lock:
+        if stream_process:
+            try:
+                stream_process.terminate()
+            except:
+                pass
+            stream_process = None
+        if stream_info.get("thread_id") == thread_id:
+            stream_info["status"] = "متوقف"
+            stream_info["start_time"] = None
+            stream_info["thread_id"] = None
+
+def start_stream(source_url, rtmp_url, quality):
+    global active_thread, stop_event
+    with stream_lock:
+        stop_event.set()
+    if active_thread and active_thread.is_alive():
+        active_thread.join()
+    with stream_lock:
+        stop_event = threading.Event()
+        thread_id = int(time.time() * 1000)
+        stream_info.update({
+            "source_url": source_url,
+            "rtmp_url": rtmp_url,
+            "quality": quality,
+            "status": "جارٍ التحميل...",
+            "last_error": None,
+            "restart_count": 0,
+            "start_time": None,
+            "thread_id": thread_id,
+            "bitrate": QUALITY_OPTIONS[quality]["bitrate"],
+            "resolution": QUALITY_OPTIONS[quality]["scale"]
+        })
+    new_thread = threading.Thread(target=run_ffmpeg, args=(source_url, rtmp_url, quality, thread_id), daemon=True)
+    active_thread = new_thread
+    new_thread.start()
+
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>Nexus Stream Control</title>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #6C5CE7;
+            --secondary: #00CEFF;
+            --dark: #1E1E2D;
+            --darker: #151521;
+            --light: #F5F6FA;
+            --success: #00D1B2;
+            --danger: #FF3860;
+            --warning: #FFDD57;
+            --info: #209CEE;
+        }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Tajawal', sans-serif;
+        }
+        body {
+            background: var(--darker);
+            color: var(--light);
+            min-height: 100vh;
+            background-image: radial-gradient(circle at 10% 20%, rgba(108, 92, 231, 0.1) 0%, transparent 20%),
+                              radial-gradient(circle at 90% 80%, rgba(0, 206, 255, 0.1) 0%, transparent 20%);
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        .logo-text {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .dashboard {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+        .panel {
+            background: var(--dark);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .panel:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 35px rgba(0,0,0,0.3);
+        }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .panel-title {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: var(--secondary);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .panel-icon {
+            width: 32px;
+            height: 32px;
+            background: rgba(0, 206, 255, 0.1);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--secondary);
+        }
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            color: rgba(255,255,255,0.8);
+        }
+        input, select {
+            width: 100%;
+            padding: 0.8rem 1rem;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 10px;
+            color: white;
+            font-size: 1rem;
+            transition: all 0.3s;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(108, 92, 231, 0.2);
+        }
+        .btn {
+            padding: 0.8rem 1.5rem;
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 1rem;
+            cursor: pointer;
+            border: none;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #5D4BDB;
+            transform: translateY(-2px);
+        }
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #E63256;
+            transform: translateY(-2px);
+        }
+        .btn-block {
+            display: block;
+            width: 100%;
+        }
+        .status-card {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.8rem 0;
+            border-bottom: 1px dashed rgba(255,255,255,0.05);
+        }
+        .status-label {
+            color: rgba(255,255,255,0.7);
+            font-weight: 500;
+        }
+        .status-value {
+            font-weight: 700;
+        }
+        .status-badge {
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 700;
+        }
+        .badge-success {
+            background: rgba(0, 209, 178, 0.1);
+            color: var(--success);
+        }
+        .badge-danger {
+            background: rgba(255, 56, 96, 0.1);
+            color: var(--danger);
+        }
+        .badge-warning {
+            background: rgba(255, 221, 87, 0.1);
+            color: var(--warning);
+        }
+        .badge-info {
+            background: rgba(32, 156, 238, 0.1);
+            color: var(--info);
+        }
+        .uptime-display {
+            background: rgba(0, 206, 255, 0.05);
+            border: 1px solid rgba(0, 206, 255, 0.1);
+            border-radius: 10px;
+            padding: 1.5rem;
+            text-align: center;
+            margin-top: 2rem;
+        }
+        .uptime-title {
+            color: var(--secondary);
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+        .uptime-value {
+            font-family: 'Courier New', monospace;
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: 2px;
+        }
+        .grid-col-span-2 {
+            grid-column: span 2;
+        }
+        @media (max-width: 768px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+            .grid-col-span-2 {
+                grid-column: span 1;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">
+                <div class="logo-icon">N</div>
+                <div class="logo-text">Nexus Stream</div>
+            </div>
+            <div class="status-badge" id="global-status">غير نشط</div>
+        </header>
+        
+        <div class="dashboard">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">
+                        <div class="panel-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4zm11.666 1.89c.682 0 1.139.47 1.187 1.107H14v-.11c-.053-1.187-1.024-2-2.342-2-1.604 0-2.518 1.05-2.518 2.751v.747c0 1.7.906 2.73 2.518 2.73 1.314 0 2.285-.792 2.342-1.939v-.114h-1.147c-.048.615-.497 1.05-1.187 1.05-.839 0-1.318-.62-1.318-1.727v-.742c0-1.112.488-1.754 1.318-1.754zm-6.188.926h.044L6.542 11h1.006L9 5.001H7.818l-.82 4.355h-.056L5.97 5.001h-.94l-.972 4.355h-.053l-.827-4.355H2L3.452 11h1.005l1.02-4.184z"/>
+                            </svg>
+                        </div>
+                        إعدادات البث
+                    </div>
+                </div>
+                <form id="streamForm">
+                    <div class="form-group">
+                        <label>رابط المصدر</label>
+                        <input type="text" name="source_url" placeholder="مثال: http://example.com/stream.m3u8" required>
+                    </div>
+                    <div class="form-group">
+                        <label>رابط RTMP الوجهة</label>
+                        <input type="text" name="rtmp_url" placeholder="مثال: rtmp://example.com/live/stream-key" required>
+                    </div>
+                    <div class="form-group">
+                        <label>جودة البث</label>
+                        <select name="quality">
+                            <option value="360">360p (SD)</option>
+                            <option value="480">480p (SD)</option>
+                            <option value="720" selected>720p (HD)</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16" style="margin-left: 5px;">
+                            <path d="m11.596 8.697-6.363 3.692c-.54.313-1.233-.066-1.233-.697V4.308c0-.63.692-1.01 1.233-.696l6.363 3.692a.802.802 0 0 1 0 1.393z"/>
+                        </svg>
+                        بدء البث
+                    </button>
+                </form>
+                <button onclick="stopStream()" class="btn btn-danger btn-block" style="margin-top: 0.5rem;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16" style="margin-left: 5px;">
+                        <path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/>
+                    </svg>
+                    إيقاف البث
+                </button>
+            </div>
+            
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">
+                        <div class="panel-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm.93-9.412-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.47l-.451-.081.082-.381 2.29-.287zM8 5.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/>
+                            </svg>
+                        </div>
+                        حالة البث
+                    </div>
+                </div>
+                <div class="status-card">
+                    <div class="status-item">
+                        <span class="status-label">الحالة الحالية:</span>
+                        <span class="status-value"><span class="status-badge badge-danger" id="status">غير نشط</span></span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">المحاولات:</span>
+                        <span class="status-value" id="restarts">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">بدأ في:</span>
+                        <span class="status-value" id="start">---</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">الخطأ الأخير:</span>
+                        <span class="status-value" id="error">---</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">جودة البث:</span>
+                        <span class="status-value" id="current_quality">---</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">الدقة:</span>
+                        <span class="status-value" id="resolution">---</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">معدل البت:</span>
+                        <span class="status-value" id="bitrate">---</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="panel grid-col-span-2">
+                <div class="panel-header">
+                    <div class="panel-title">
+                        <div class="panel-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M8.5 5.5a.5.5 0 0 0-1 0v3.362l-1.429 2.38a.5.5 0 1 0 .858.515l1.5-2.5A.5.5 0 0 0 8.5 9V5.5z"/>
+                                <path d="M6.5 0a.5.5 0 0 0 0 1H7v1.07a7.001 7.001 0 0 0-3.273 12.474l-.602.602a.5.5 0 0 0 .707.708l.746-.746A6.97 6.97 0 0 0 8 16a6.97 6.97 0 0 0 3.422-.892l.746.746a.5.5 0 0 0 .707-.708l-.601-.602A7.001 7.001 0 0 0 9 2.07V1h.5a.5.5 0 0 0 0-1h-3zm1.038 3.018a6.093 6.093 0 0 1 .924 0 6 6 0 1 1-.924 0zM0 3.5c0 .753.333 1.429.86 1.887A8.035 8.035 0 0 1 4.387 1.86 2.5 2.5 0 0 0 0 3.5zM13.5 1c-.753 0-1.429.333-1.887.86a8.035 8.035 0 0 1 3.527 3.527A2.5 2.5 0 0 0 13.5 1z"/>
+                            </svg>
+                        </div>
+                        مدة التشغيل
+                    </div>
+                </div>
+                <div class="uptime-display">
+                    <div class="uptime-title">مدة البث المستمر</div>
+                    <div class="uptime-value" id="uptime">00:00:00</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('streamForm').onsubmit = function(e) {
+            e.preventDefault();
+            fetch('/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams(new FormData(this))
+            }).then(() => updateStatus());
+        };
+        
+        function stopStream() {
+            fetch('/stop', { method: 'POST' }).then(() => updateStatus());
+        }
+        
+        function updateStatus() {
+            fetch('/status').then(res => res.json()).then(data => {
+                const statusElement = document.getElementById('status');
+                statusElement.innerText = data.status || '---';
+                
+                // Update status badge color
+                statusElement.className = 'status-badge ';
+                if (data.status === 'جارٍ البث') {
+                    statusElement.classList.add('badge-success');
+                    document.getElementById('global-status').className = 'status-badge badge-success';
+                    document.getElementById('global-status').innerText = 'نشط';
+                } else if (data.status === 'متوقف') {
+                    statusElement.classList.add('badge-danger');
+                    document.getElementById('global-status').className = 'status-badge badge-danger';
+                    document.getElementById('global-status').innerText = 'غير نشط';
+                } else if (data.status && data.status.includes('خطأ')) {
+                    statusElement.classList.add('badge-warning');
+                    document.getElementById('global-status').className = 'status-badge badge-warning';
+                    document.getElementById('global-status').innerText = 'خطأ';
+                } else {
+                    statusElement.classList.add('badge-info');
+                }
+                
+                document.getElementById('restarts').innerText = data.restart_count || 0;
+                document.getElementById('start').innerText = data.start_time ? new Date(data.start_time * 1000).toLocaleTimeString() : '---';
+                document.getElementById('error').innerText = data.last_error || '---';
+                document.getElementById('current_quality').innerText = data.quality || '---';
+                document.getElementById('resolution').innerText = data.resolution || '---';
+                document.getElementById('bitrate').innerText = data.bitrate || '---';
+                
+                if (data.start_time) {
+                    const uptime_sec = Math.floor(Date.now() / 1000 - data.start_time);
+                    document.getElementById('uptime').innerText = formatDuration(uptime_sec);
+                }
+            });
+        }
+        
+        function formatDuration(s) {
+            let hrs = Math.floor(s / 3600);
+            let mins = Math.floor((s % 3600) / 60);
+            let secs = Math.floor(s % 60);
+            return [hrs, mins, secs].map(v => v < 10 ? "0" + v : v).join(":");
+        }
+        
+        setInterval(updateStatus, 1000);
+        updateStatus();
+    </script>
+</body>
+</html>
+""")
+
+@app.route("/", methods=["POST"])
+def handle_form():
+    source_url = request.form.get("source_url", "").strip()
+    rtmp_url = request.form.get("rtmp_url", "").strip()
+    quality = request.form.get("quality", "360").strip()
+    if source_url and rtmp_url and quality in QUALITY_OPTIONS:
+        start_stream(source_url, rtmp_url, quality)
+        return '', 204
+    return 'البيانات غير صالحة', 400
+
+@app.route("/stop", methods=["POST"])
+def stop_stream():
+    global stop_event, stream_process
+    with stream_lock:
+        stop_event.set()
+        if stream_process:
+            try:
+                stream_process.terminate()
+            except:
+                pass
+            stream_process = None
+        stream_info["status"] = "متوقف"
+        stream_info["thread_id"] = None
+    return jsonify(success=True)
+
+@app.route("/status")
+def get_status():
+    with stream_lock:
+        info = stream_info.copy()
+        if info["start_time"]:
+            info["start_time"] = int(info["start_time"])
+    return jsonify(info)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

@@ -1,0 +1,255 @@
+# -*- coding: utf-8 -*-
+
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import subprocess
+import threading
+import datetime
+import os
+import signal
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#             الرجاء وضع توكن البوت الخاص بك هنا                 #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+BOT_TOKEN = "8053389792:AAHNFNCsgFXMn_qFt2VKM6yKWPlgoNz5WQY"
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# تهيئة البوت
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# قاموس لتخزين حالة البث (لكل مستخدم على حدة)
+# هذا يسمح لعدة مستخدمين باستخدام البوت في نفس الوقت دون تداخل
+stream_states = {}
+
+def get_user_state(user_id):
+    """الحصول على حالة المستخدم أو إنشاؤها إذا لم تكن موجودة"""
+    if user_id not in stream_states:
+        stream_states[user_id] = {
+            "is_streaming": False,
+            "process": None,
+            "input_url": None,
+            "rtmp_url": None,
+            "start_time": None,
+            "last_message_id": None,
+        }
+    return stream_states[user_id]
+
+def gen_main_keyboard(user_id):
+    """إنشاء لوحة المفاتيح الرئيسية مع أزرار التحكم"""
+    state = get_user_state(user_id)
+    markup = InlineKeyboardMarkup(row_width=2)
+
+    # زر بدء/إيقاف البث
+    if state["is_streaming"]:
+        start_stop_button = InlineKeyboardButton("⏹️ إيقاف البث", callback_data="stop_stream")
+    else:
+        start_stop_button = InlineKeyboardButton("▶️ بدء البث", callback_data="start_stream")
+
+    # أزرار الإعدادات والحالة
+    set_input_button = InlineKeyboardButton("📥 إعداد رابط الإدخال", callback_data="set_input")
+    set_rtmp_button = InlineKeyboardButton("📤 إعداد رابط RTMP", callback_data="set_rtmp")
+    status_button = InlineKeyboardButton("🔄 تحديث الحالة", callback_data="status")
+
+    markup.add(start_stop_button)
+    markup.add(set_input_button, set_rtmp_button)
+    markup.add(status_button)
+    return markup
+
+def get_status_message(user_id):
+    """تنسيق رسالة الحالة الحالية للمستخدم"""
+    state = get_user_state(user_id)
+    status_icon = "🟢 (نشط)" if state["is_streaming"] else "🔴 (متوقف)"
+    
+    # حساب مدة البث
+    uptime = "N/A"
+    if state["is_streaming"] and state["start_time"]:
+        duration = datetime.datetime.now() - state["start_time"]
+        total_seconds = int(duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime = f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    # تنسيق الروابط لسهولة القراءة
+    input_url_display = state["input_url"] if state["input_url"] else "لم يتم التعيين"
+    rtmp_url_display = state["rtmp_url"] if state["rtmp_url"] else "لم يتم التعيين"
+
+    # الرسالة الكاملة
+    message = (
+        f"🖥️ **لوحة تحكم البث** 🖥️\n\n"
+        f"**الحالة الحالية:** {status_icon}\n"
+        f"**مدة البث:** `{uptime}`\n\n"
+        f"🔗 **رابط الإدخال (HLS/Video):**\n`{input_url_display}`\n\n"
+        f"📡 **رابط الإخراج (RTMP):**\n`{rtmp_url_display}`\n\n"
+        f"استخدم الأزرار أدناه للتحكم في عملية البث."
+    )
+    return message
+
+def run_ffmpeg_process(user_id):
+    """تشغيل عملية FFmpeg في thread منفصل"""
+    state = get_user_state(user_id)
+    
+    if not state["input_url"] or not state["rtmp_url"]:
+        bot.send_message(user_id, "خطأ: يجب تعيين كل من رابط الإدخال والإخراج قبل بدء البث.")
+        return
+
+    # تحديث الحالة
+    state["is_streaming"] = True
+    state["start_time"] = datetime.datetime.now()
+    update_status_message(user_id)
+
+    # أمر FFmpeg
+    # -re: يقرأ الإدخال بالمعدل الأصلي
+    # -c:v copy: ينسخ ترميز الفيديو دون إعادة ترميز (أسرع وأقل استهلاكاً للموارد)
+    # -c:a aac: يعيد ترميز الصوت إلى AAC وهو متوافق بشكل كبير مع RTMP
+    # -f flv: يحدد صيغة الإخراج إلى FLV (Flash Video) وهي الصيغة المستخدمة في RTMP
+    command = [
+        'ffmpeg', '-re', '-i', state["input_url"],
+        '-c:v', 'copy', '-c:a', 'aac', '-ar', '44100', '-b:a', '128k',
+        '-f', 'flv', state["rtmp_url"]
+    ]
+    
+    try:
+        # استخدام Popen لتشغيل العملية في الخلفية
+        # preexec_fn=os.setsid يسمح بقتل العملية ومجموعة العمليات التابعة لها بشكل موثوق
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
+        state["process"] = process
+        
+        # انتظار انتهاء العملية
+        process.wait()
+
+    except FileNotFoundError:
+        bot.send_message(user_id, "خطأ فادح: لم يتم العثور على FFmpeg. يرجى التأكد من تثبيته وإضافته إلى مسار النظام (PATH).")
+    except Exception as e:
+        bot.send_message(user_id, f"حدث خطأ غير متوقع أثناء تشغيل FFmpeg: {e}")
+    finally:
+        # تنظيف الحالة بعد انتهاء البث أو فشله
+        state["is_streaming"] = False
+        state["process"] = None
+        state["start_time"] = None
+        update_status_message(user_id)
+        bot.send_message(user_id, "ℹ️ تم إيقاف البث (إما بشكل طبيعي أو بسبب خطأ).")
+
+
+def stop_streaming_process(user_id):
+    """إيقاف عملية البث الحالية"""
+    state = get_user_state(user_id)
+    if state["is_streaming"] and state["process"]:
+        try:
+            # إرسال إشارة SIGTERM إلى مجموعة العمليات لضمان إغلاق FFmpeg بشكل كامل
+            os.killpg(os.getpgid(state["process"].pid), signal.SIGTERM)
+            bot.send_message(user_id, "✅ تم إرسال أمر الإيقاف بنجاح.")
+        except ProcessLookupError:
+            # في حال كانت العملية قد انتهت بالفعل
+            pass
+        except Exception as e:
+            bot.send_message(user_id, f"حدث خطأ أثناء محاولة إيقاف البث: {e}")
+        finally:
+            # تحديث الحالة فوراً
+            state["is_streaming"] = False
+            state["process"] = None
+            state["start_time"] = None
+    else:
+        bot.send_message(user_id, "لا يوجد بث نشط لإيقافه.")
+    
+    update_status_message(user_id)
+
+
+def update_status_message(user_id):
+    """تحديث رسالة الحالة أو إرسال واحدة جديدة"""
+    state = get_user_state(user_id)
+    chat_id = user_id
+    message_id = state.get("last_message_id")
+    text = get_status_message(user_id)
+    markup = gen_main_keyboard(user_id)
+
+    try:
+        if message_id:
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            # إذا لم تكن هناك رسالة سابقة، أرسل واحدة جديدة
+            sent_message = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+            state["last_message_id"] = sent_message.message_id
+    except telebot.apihelper.ApiTelegramException as e:
+        # إذا فشل التعديل (مثلاً، تم حذف الرسالة)، أرسل رسالة جديدة
+        if "message to edit not found" in e.description:
+            sent_message = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
+            state["last_message_id"] = sent_message.message_id
+
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    """إرسال رسالة الترحيب ولوحة التحكم عند بدء التشغيل"""
+    user_id = message.from_user.id
+    welcome_text = (
+        "أهلاً بك في بوت التحكم بالبث!\n"
+        "هذا البوت يسمح لك ببث الفيديو من أي رابط مباشر أو HLS إلى خادم RTMP."
+    )
+    bot.send_message(user_id, welcome_text)
+    update_status_message(user_id) # إرسال لوحة التحكم
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_query(call):
+    """معالجة ضغطات الأزرار"""
+    user_id = call.from_user.id
+    state = get_user_state(user_id)
+    
+    # تخزين message_id لتحديثه لاحقاً
+    state["last_message_id"] = call.message.message_id
+
+    if call.data == "start_stream":
+        if state["is_streaming"]:
+            bot.answer_callback_query(call.id, "البث نشط بالفعل!", show_alert=True)
+        elif not state["input_url"] or not state["rtmp_url"]:
+            bot.answer_callback_query(call.id, "يرجى تعيين روابط الإدخال والإخراج أولاً.", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "⏳ جارٍ بدء البث...")
+            # بدء البث في thread جديد لمنع حظر البوت
+            threading.Thread(target=run_ffmpeg_process, args=(user_id,)).start()
+    
+    elif call.data == "stop_stream":
+        bot.answer_callback_query(call.id, "⏳ جارٍ إيقاف البث...")
+        stop_streaming_process(user_id)
+
+    elif call.data == "set_input":
+        msg = bot.send_message(user_id, "الرجاء إرسال رابط الإدخال (HLS أو رابط فيديو مباشر):")
+        bot.register_next_step_handler(msg, process_input_url_step)
+
+    elif call.data == "set_rtmp":
+        msg = bot.send_message(user_id, "الرجاء إرسال رابط الإخراج (RTMP) كاملاً مع مفتاح البث:")
+        bot.register_next_step_handler(msg, process_rtmp_url_step)
+
+    elif call.data == "status":
+        bot.answer_callback_query(call.id, "🔄 تم تحديث الحالة.")
+        update_status_message(user_id)
+
+def process_input_url_step(message):
+    """معالجة رابط الإدخال الذي يرسله المستخدم"""
+    user_id = message.from_user.id
+    state = get_user_state(user_id)
+    # التحقق من أن الرابط يبدأ بـ http
+    if message.text.startswith("http"):
+        state["input_url"] = message.text
+        bot.send_message(user_id, "✅ تم حفظ رابط الإدخال بنجاح.")
+    else:
+        bot.send_message(user_id, "❌ رابط غير صالح. يجب أن يبدأ بـ http أو https.")
+    
+    update_status_message(user_id)
+
+def process_rtmp_url_step(message):
+    """معالجة رابط الإخراج الذي يرسله المستخدم"""
+    user_id = message.from_user.id
+    state = get_user_state(user_id)
+    # التحقق من أن الرابط يبدأ بـ rtmp
+    if message.text.startswith("rtmp"):
+        state["rtmp_url"] = message.text
+        bot.send_message(user_id, "✅ تم حفظ رابط الإخراج (RTMP) بنجاح.")
+    else:
+        bot.send_message(user_id, "❌ رابط غير صالح. يجب أن يبدأ بـ rtmp:// أو rtmps://.")
+    
+    update_status_message(user_id)
+
+
+print("البوت قيد التشغيل...")
+# بدء تشغيل البوت
+bot.polling(none_stop=True)
+

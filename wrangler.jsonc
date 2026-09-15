@@ -1,0 +1,5 @@
+{
+  "name": "enlil-hls-relay",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-15"
+}
